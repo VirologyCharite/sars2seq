@@ -1,3 +1,4 @@
+import copy
 
 class Checker:
     def __init__(self, name, changes, nt):
@@ -34,9 +35,10 @@ class Checker:
         def check(genome):
             return func1(genome) and func2(genome)
 
-        self._func = check
-        self.description = f'({self.description} AND {other.description})'
-        return self
+        newChecker = copy.copy(self)
+        newChecker._func = check
+        newChecker.description = f'({self.description} AND {other.description})'
+        return newChecker
 
     def __or__(self, other):
 
@@ -45,9 +47,10 @@ class Checker:
         def check(genome):
             return func1(genome) or func2(genome)
 
-        self._func = check
-        self.description = f'({self.description} OR {other.description})'
-        return self
+        newChecker = copy.copy(self)
+        newChecker._func = check
+        newChecker.description = f'({self.description} OR {other.description})'
+        return newChecker
 
 
 class AAChecker(Checker):
