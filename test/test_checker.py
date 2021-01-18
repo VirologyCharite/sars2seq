@@ -116,9 +116,9 @@ class Test_EPI_ISL_601443(TestCase):
 
         checker3 = checker1 & checker2
 
-        expression = (checker1 != checker3) and (checker1 is not checker3)
-        expression = expression and (id(checker1._func) == checker1_func_id)
-        self.assertTrue(expression)
+        self.assertNotEqual(checker1, checker3)
+        self.assertIsNot(checker1,checker3)
+        self.assertEqual(id(checker1._func), checker1_func_id)
 
     def testOrOperator(self):
         """
@@ -130,7 +130,7 @@ class Test_EPI_ISL_601443(TestCase):
 
         checker3 = checker1 | checker2
 
-        expression = (checker1 != checker3) and (checker1 is not checker3)
-        expression = expression and (id(checker1._func) == checker1_func_id)
-        self.assertTrue(expression)
+        self.assertNotEqual(checker1, checker3)
+        self.assertIsNot(checker1, checker3)
+        self.assertEqual(id(checker1._func), checker1_func_id)
 

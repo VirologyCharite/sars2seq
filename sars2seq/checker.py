@@ -30,10 +30,8 @@ class Checker:
 
     def __and__(self, other):
 
-        func1, func2 = self._func, other._func
-
         def check(genome):
-            return func1(genome) and func2(genome)
+            return self(genome) and other(genome)
 
         newChecker = copy.copy(self)
         newChecker._func = check
@@ -42,10 +40,8 @@ class Checker:
 
     def __or__(self, other):
 
-        func1, func2 = self._func, other._func
-
         def check(genome):
-            return func1(genome) or func2(genome)
+            return self(genome) or other(genome)
 
         newChecker = copy.copy(self)
         newChecker._func = check
