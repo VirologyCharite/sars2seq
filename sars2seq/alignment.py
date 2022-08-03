@@ -1,4 +1,4 @@
-from typing import Dict, Iterable, Iterator, List, Optional, TextIO, Tuple, Union
+from typing import Dict, Iterable, Iterator, Optional, TextIO, Tuple, Union
 
 import argparse
 from Bio.Seq import Seq
@@ -35,7 +35,7 @@ class AlignmentError(Sars2SeqError):
     "There is an unexpected problem in the alignment."
 
 
-def addAlignerOption(parser: argparse.Namespace) -> None:
+def addAlignerOption(parser: argparse.ArgumentParser) -> None:
     """
     Add a command line option for specifying an aligner for SARS2Alignment.
 
@@ -111,88 +111,6 @@ def alignmentEnd(s: str, startOffset: int, length: int) -> int:
     return index
 
 
-def offsetInfoMultipleGenomes(
-    genomes,
-    offset,
-    relativeToFeature=False,
-    aa=False,
-    featureName=None,
-    includeUntranslated=False,
-    minReferenceCoverage=None,
-):
-    """
-    Get information about an offset for multiple SARS2Alignment instances.
-
-    @param genomes: An interable of C{SARS2Alignment} instances.
-    @param offset: An C{int} offset.
-    @param relativeToFeature: If C{True}, the offset is relative to the
-        start of the feature that occurs at this offset.
-    @param aa: If C{True}, the offset is a number of amino acids, else a
-        number of nucleotides.
-    @param featureName: If not C{None} and multiple features occur at this
-        offset, use the feature with this name.
-    @param includeUntranslated: If C{True}, also return features that are
-        not translated.
-    @param minReferenceCoverage: The C{float} fraction of non-N bases required
-        in the genome (or feature, if one is given) in order for it to be
-        processed. If the required coveragel is not met, C{None} is returned.
-    @raise KeyError: If the feature name is unknown.
-    @raise ValueError: If an incorrect arguments is passed
-        (see SARS2Alignment.offsetInfo) or if all genomes were not aligned
-        against the same reference id.
-    @raise AmbiguousFeatureError: If multiple features occur at the offset
-        and C{featureName} does not indicate the one to use.
-    @return: A C{dict} with information about what is found in the
-        reference and the genomes at the offset. This is identical to the
-        result dictionary returned by C{SARS2Alignment.offsetInfo}, but the
-        'genome' key is replaced with a 'genomes' key that holds a C{list}
-        of genome results (each is a C{dict}, as returned by
-        C{SARS2Alignment.offsetInfo}). The order of genome info in the list
-        matches the order in the passed C{genomes}.  If no genomes are passed,
-        or all passed genomes have insufficient coverage, C{None} is returned.
-    """
-    ids = set(genome.features.reference.id for genome in genomes)
-
-    if len(ids) == 0:
-        raise ValueError("No SARS2Alignment instances given.")
-    elif len(ids) != 1:
-        raise ValueError(
-            f"SARS2Alignment instances with differing reference ids "
-            f'passed to offsetInfoMultipleGenomes: {", ".join(sorted(ids))}.'
-        )
-
-    first = True
-    result = None
-    genomeResults = []
-
-    for genome in genomes:
-        thisResult = genome.offsetInfo(
-            offset,
-            relativeToFeature=relativeToFeature,
-            aa=aa,
-            featureName=featureName,
-            includeUntranslated=includeUntranslated,
-            minReferenceCoverage=minReferenceCoverage,
-        )
-
-        if first and thisResult:
-            result = thisResult.copy()
-            # Make sure nothing crucial has changed in the returned dict
-            # from SARS2Alignment.offsetInfo
-            assert "genome" in result
-            assert "genomes" not in result
-            del result["genome"]
-            first = False
-
-        genomeResults.append(thisResult["genome"] if thisResult else None)
-
-    if result is None:
-        return None
-    else:
-        result["genomes"] = genomeResults
-        return result
-
-
 class SARS2Alignment:
     """
     Methods for working with a SARS-CoV-2 genome aligned to a reference.
@@ -212,6 +130,10 @@ class SARS2Alignment:
         ambiguous nucleotides that are possibly correct as actually being
         correct. Otherwise, the edlib aligner is strict and nucleotide codes
         only match themselves.
+    @param untranslatable: A C{dict} with C{str} keys and values. If any of
+        the keys appears in a codon, the corresponding value is added to the
+        translation. This can be used e.g., to make occurrences of '?'
+        translate into '-' or 'X'.
     @raise AlignmentError: If the genome and reference sequences both start
         or end with '-' characters, or if pre-aligned sequences are not of
         the same length.
@@ -226,17 +148,17 @@ class SARS2Alignment:
         genomeAligned: Optional[DNARead] = None,
         aligner: str = DEFAULT_ALIGNER,
         matchAmbiguous: bool = True,
+        untranslatable: Optional[Dict[str, str]] = None,
     ):
-        # Geneious uses ? to indicate unknown nucleotides, at least when it
-        # exports a consensus / alignment. Replace with N.
-        self.genome = DNARead(genome.id, genome.sequence.replace("?", "N"))
-        # self.features = Features() if features is None else features
-        if features is None:
-            self.features = Features()
-        else:
-            self.features = features
+        if aligner not in ALIGNERS:
+            raise ValueError(f"Unknown aligner {aligner!r}.")
+
+        self.genome = genome
+        self.features = Features() if features is None else features
         self._matchAmbiguous = matchAmbiguous
-        self._getAlignment(referenceAligned, genomeAligned, aligner)
+        self._aligner = aligner
+        self._untranslatable = untranslatable
+        self._getAlignment(referenceAligned, genomeAligned)
         self.gappedOffsets = getGappedOffsets(self.referenceAligned.sequence)
         self._cache: dict = {"aa": {}, "nt": {}}
 
@@ -244,7 +166,6 @@ class SARS2Alignment:
         self,
         referenceAligned: Optional[DNARead] = None,
         genomeAligned: Optional[DNARead] = None,
-        aligner: str = DEFAULT_ALIGNER,
     ) -> None:
         """
         Align the reference and the genome.
@@ -255,8 +176,6 @@ class SARS2Alignment:
         @param genomeAligned: A C{dark.reads.Read} instance with an aligned
             genome sequence, or C{None} if the alignment should be done here.
             If not C{None} then C{referenceAligned} must also be given.
-        @param aligner: A C{str} specifying the alignment algorithm to use.
-            Either 'mafft' (the default) or 'edlib' (experimental).
         @raise ValueError: If an already aligned genome is given but no
             aligned reference is also given, or vice versa.
         @raise AlignmentError: If the genome and reference sequences both start
@@ -278,16 +197,15 @@ class SARS2Alignment:
                 genomeAligned = self.genome
             else:
                 reads = Reads([self.features.reference, self.genome])
-                if aligner == "mafft":
+                if self._aligner == "mafft":
                     referenceAligned, genomeAligned = mafft(
                         reads, options=MAFFT_OPTIONS
                     )
-                elif aligner == "edlib":
+                else:
+                    assert self._aligner == "edlib"
                     referenceAligned, genomeAligned = edlibAlign(
                         reads, matchAmbiguous=self._matchAmbiguous
                     )
-                else:
-                    raise ValueError(f"Unknown aligner {aligner!r}.")
 
             if DEBUG:
                 print("ALIGNING")
@@ -311,7 +229,7 @@ class SARS2Alignment:
             else:
                 error = (
                     f"The length of the aligned reference produced "
-                    f"by {self.aligner} ({len(referenceAligned)}) does "
+                    f"by {self._aligner} ({len(referenceAligned)}) does "
                     f"not match the length of the aligned genome "
                     f"({len(genomeAligned)})."
                 )
@@ -347,19 +265,36 @@ class SARS2Alignment:
         self.referenceAligned: DNARead = referenceAligned
         self.genomeAligned: DNARead = genomeAligned
 
-    def ntSequences(self, featureName: str) -> Tuple[DNARead, DNARead]:
+    def ntSequences(
+        self,
+        featureName: str,
+        reverseComplement: bool = False,
+        addFeatureToId: bool = True,
+        raiseOnReferenceGaps: bool = True,
+    ) -> Tuple[DNARead, DNARead]:
         """
         Get the aligned nucelotide sequences.
 
         @param featureName: A C{str} feature name.
+        @param reverseComplement: If C{True} and the feature does not have a
+            forward orientation in the genome, its reverse complement will be
+            returned.
+        @param addFeatureToId: If C{True}, the feature name (in parentheses,
+            preceded by a space) will be appended to the id of the returned
+            sequences.
+        @param raiseOnReferenceGaps: A C{bool}. If C{True} and the aligner
+            suggests a gap in the reference, raise a ReferenceInsertionError.
         @raise AssertionError: If the aligned reference and genome sequences
             are not the same length.
+        @raise ReferenceInsertionError: (as above for raiseOnReferenceGaps).
         @return: A 2-C{tuple} of C{dark.reads.DNARead} instances, with 1) the
             nucleotides for the feature as located in the reference genome and
             2) the corresponding nucleotides from the genome being examined.
         """
+        cacheKey = featureName, reverseComplement, addFeatureToId
+
         try:
-            return self._cache["nt"][featureName]
+            return self._cache["nt"][cacheKey]
         except KeyError:
             pass
 
@@ -369,65 +304,102 @@ class SARS2Alignment:
         # 'offset' is the offset in the (possibly gapped) alignment.
         offset = self.gappedOffsets[feature["start"]]
         end = alignmentEnd(self.referenceAligned.sequence, offset, length)
+        idSuffix = f" ({name})" if addFeatureToId else ""
 
         referenceNt = DNARead(
-            self.features.reference.id + f" ({name})",
+            self.features.reference.id + idSuffix,
             self.referenceAligned.sequence[offset:end],
         )
 
-        # In general, there should not be insertions to the reference. There
-        # are lineages with insertions in the Spike (e.g. B.1.214.2) that we
-        # can correct for in the downstream processing, therefore the error is
-        # not raised for the Spike.
-        if "-" in referenceNt.sequence and name != "surface glycoprotein":
-            raise ReferenceInsertionError(
-                f"MAFFT suggests a reference insertion into {featureName!r}."
-            )
-
         genomeNt = DNARead(
-            self.genome.id + f" ({name})", self.genomeAligned.sequence[offset:end]
+            self.genome.id + idSuffix, self.genomeAligned.sequence[offset:end]
         )
 
+        # Use True as a default for 'forward' in the following, as some
+        # features may be unannotated regions, and these do not have a
+        # 'forward' key.
+        if reverseComplement and not feature.get("forward", True):
+            referenceNt = referenceNt.reverseComplement()
+            genomeNt = genomeNt.reverseComplement()
+
         assert len(referenceNt) == len(genomeNt)
+
+        # In general, there should not be insertions to the reference.
+        # There are SARS-CoV-2 lineages with insertions in the Spike
+        # (e.g. B.1.214.2) that we can correct for in the downstream
+        # processing, therefore the error is not raised for the SARS-CoV-2
+        # Spike.
+        if (
+            raiseOnReferenceGaps
+            and "-" in referenceNt.sequence
+            and (not self.features.sars2 or name != "surface glycoprotein")
+        ):
+            raise ReferenceInsertionError(
+                f"{self._aligner} aligner suggested a reference insertion "
+                f"into {featureName!r}."
+            )
 
         if DEBUG:
             print("NT MATCH:")
             print("ref  nt:", referenceNt.sequence[SLICE])
             print("gen  nt:", genomeNt.sequence[SLICE])
 
-        self._cache["nt"][featureName] = referenceNt, genomeNt
+        self._cache["nt"][cacheKey] = referenceNt, genomeNt
 
         return referenceNt, genomeNt
 
-    def aaSequences(self, featureName: str) -> Tuple[DNARead, DNARead]:
+    def aaSequences(
+        self,
+        featureName: str,
+        addFeatureToId: bool = True,
+        raiseOnReferenceGaps: bool = True,
+    ) -> Tuple[DNARead, DNARead]:
         """
         Match the genome and the reference at the amino acid level.
 
         @param featureName: A C{str} feature name.
+        @param addFeatureToId: If C{True}, the feature name (in parentheses,
+            preceded by a space) will be appended to the id of the returned
+            sequences.
+        @param raiseOnReferenceGaps: A C{bool}. If C{True} and the aligner
+            suggests a gap in the reference, raise a ReferenceInsertionError.
+        @raise ReferenceInsertionError: (as above for raiseOnReferenceGaps).
         @raise TranslationError: or one of its sub-classes (see translate.py)
             if a feature nucleotide sequence cannot be translated.
         @return: A 2-C{tuple} of C{dark.reads.AARead} instances, with 1) the
             amino acids for the feature as located in the reference genome and
             2) the corresponding amino acids from the genome being examined.
         """
+        cacheKey = featureName, addFeatureToId
+
         try:
-            return self._cache["aa"][featureName]
+            return self._cache["aa"][cacheKey]
         except KeyError:
             pass
 
-        referenceNt, genomeNt = self.ntSequences(featureName)
+        referenceNt, genomeNt = self.ntSequences(
+            featureName,
+            raiseOnReferenceGaps=raiseOnReferenceGaps,
+            reverseComplement=True,
+        )
         feature = self.features[featureName]
         name = feature["name"]
+        idSuffix = f" ({name})" if addFeatureToId else ""
 
         gapCount = genomeNt.sequence.count("-")
-        if name == "surface glycoprotein" and gapCount and gapCount % 3 == 0:
+        if (
+            self.features.sars2
+            and name == "surface glycoprotein"
+            and gapCount
+            and gapCount % 3 == 0
+        ):
             referenceAa = referenceAaAligned = AARead(
-                f"{self.features.reference.id} ({name})",
+                self.features.reference.id + idSuffix,
                 translateSpike(referenceNt.sequence),
             )
 
             genomeAa = genomeAaAligned = AARead(
-                f"{self.genome.id} ({name})", translateSpike(genomeNt.sequence)
+                self.genome.id + idSuffix, translateSpike(genomeNt.sequence)
             )
 
             if len(referenceAaAligned) != len(genomeAaAligned):
@@ -436,19 +408,68 @@ class SARS2Alignment:
                     f"({len(genomeAaAligned)} != {len(referenceAaAligned)})."
                 )
         else:
+            if "-" in referenceNt.sequence:
+                assert not raiseOnReferenceGaps
+                referenceNtNoGaps = DNARead(
+                    referenceNt.id, referenceNt.sequence.replace("-", "")
+                )
+            else:
+                referenceNtNoGaps = referenceNt
+
             referenceAa = AARead(
-                f"{self.features.reference.id} ({name})",
-                feature.get("translation", translate(feature["sequence"], name)),
+                self.features.reference.id + idSuffix,
+                feature.get(
+                    "translation",
+                    translate(
+                        referenceNtNoGaps.sequence,
+                        name,
+                        untranslatable=self._untranslatable,
+                    ),
+                ),
             )
 
-            genomeAa = AARead(
-                f"{self.genome.id} ({name})",
-                translate(genomeNt.sequence.replace("-", ""), name),
-            )
+            genomeNtNoGaps = DNARead(genomeNt.id, genomeNt.sequence.replace("-", ""))
 
-            referenceAaAligned, genomeAaAligned = mafft(
-                Reads([referenceAa, genomeAa]), options=MAFFT_OPTIONS
-            )
+            if len(genomeNtNoGaps) == 0:
+                # This feature has been deleted in the genome. Give back an
+                # "aligned" genome that is all gaps. This matches what
+                # ntSequences will return.
+                referenceAaAligned = referenceAa
+                genomeAaAligned = AARead(
+                    self.features.reference.id + idSuffix, "-" * len(referenceAaAligned)
+                )
+            else:
+
+                genomeAa = AARead(
+                    self.genome.id + idSuffix,
+                    translate(
+                        genomeNtNoGaps.sequence,
+                        name,
+                        untranslatable=self._untranslatable,
+                    ),
+                )
+
+                if self._aligner == "mafft":
+                    referenceAaAligned, genomeAaAligned = mafft(
+                        Reads([referenceAa, genomeAa]), options=MAFFT_OPTIONS
+                    )
+                else:
+                    assert self._aligner == "edlib"
+                    # This is an AA alignment, so set matchAmbiguous=False
+                    # unconditionally since the edlib aligner only knows about
+                    # nucleotide ambiguities.
+                    try:
+                        referenceAaAligned, genomeAaAligned = edlibAlign(
+                            Reads([referenceAa, genomeAa]), matchAmbiguous=False
+                        )
+                    except Exception as e:
+                        raise AlignmentError(
+                            f"Could not edlib align: {e}\n"
+                            f"  ref nt: {referenceNt.sequence}\n"
+                            f"  gen nt: {genomeNt.sequence}"
+                            f"  ref aa: {referenceAa.sequence}\n"
+                            f"  gen aa: {genomeAa.sequence}"
+                        )
 
         if DEBUG:
             print(f"AA MATCH {name}:")
@@ -474,7 +495,7 @@ class SARS2Alignment:
                 genomeAaAligned.sequence[SLICE],
             )
 
-        self._cache["aa"][featureName] = referenceAaAligned, genomeAaAligned
+        self._cache["aa"][cacheKey] = referenceAaAligned, genomeAaAligned
         return referenceAaAligned, genomeAaAligned
 
     def _checkChange(
@@ -482,7 +503,7 @@ class SARS2Alignment:
         base: str,
         offset: int,
         read: DNARead,
-        change: str,
+        change: Union[str, Tuple[Optional[str], int, Optional[str]]],
         featureName: str,
         onError,
         errFp,
@@ -535,7 +556,15 @@ class SARS2Alignment:
         aa: bool = False,
         onError: str = "raise",
         errFp: Optional[TextIO] = None,
-    ) -> Tuple[int, int, Dict[str, Tuple[bool, Optional[str], bool, Optional[str]]]]:
+        raiseOnReferenceGaps: bool = True,
+    ) -> Tuple[
+        int,
+        int,
+        Dict[
+            Union[str, Tuple[str, int, str]],
+            Tuple[bool, Optional[str], bool, Optional[str]],
+        ],
+    ]:
         """Check that a set of changes all happened as expected.
 
         @param featureName: A C{str} feature name.
@@ -556,6 +585,8 @@ class SARS2Alignment:
             case an error message will be printed to C{errFp}.
         @param errFp: An open file pointer to write error messages to, if any.
             Only used if C{onError} is 'print'.
+        @param raiseOnReferenceGaps: A C{bool}. If C{True} and the aligner
+            suggests a gap in the reference, raise a ReferenceInsertionError.
         @raise ValueError: If a change string cannot be parsed.
         @raise IndexError: If the offset of a change exceeds the length of the
             sequence being checked.
@@ -573,8 +604,8 @@ class SARS2Alignment:
         """
 
         def _getChanges(
-            changes: Union[str, Tuple[str, int, str]]
-        ) -> Iterator[Tuple[bool, Optional[str], bool, Optional[str]]]:
+            changes: Union[str, Iterable[Tuple[str, int, str]]]
+        ) -> Iterator[Tuple[Union[str, Tuple[str, int, str]], str, int, str]]:
             if isinstance(changes, str):
                 for change in changes.split():
                     referenceBase, offset, genomeBase = splitChange(change)
@@ -584,12 +615,16 @@ class SARS2Alignment:
                     referenceBase, offset, genomeBase = change
                     yield change, referenceBase, offset, genomeBase
 
-        result = {}
+        result: Dict[
+            Union[str, Tuple[Optional[str], int, Optional[str]]],
+        ] = {}
         testCount = errorCount = 0
 
         try:
             reference, genome = (
-                self.aaSequences(featureName) if aa else self.ntSequences(featureName)
+                self.aaSequences(featureName, raiseOnReferenceGaps=raiseOnReferenceGaps)
+                if aa
+                else self.ntSequences(featureName)
             )
         except TranslationError as e:
             if onError == "raise":
@@ -630,6 +665,7 @@ class SARS2Alignment:
         variant: Union[str, dict],
         onError: str = "raise",
         errFp: Optional[TextIO] = None,
+        raiseOnReferenceGaps: bool = True,
     ) -> Tuple[int, int, Dict[str, Tuple[bool, Optional[str], bool, Optional[str]]]]:
         """
         Check that a set of changes in different features all happened as
@@ -643,6 +679,8 @@ class SARS2Alignment:
             case an error message will be printed to C{errFp}.
         @param errFp: An open file pointer to write error messages to, if any.
             Only used if C{onError} is 'print'.
+        @param raiseOnReferenceGaps: A C{bool}. If C{True} and the aligner
+            suggests a gap in the reference, raise a ReferenceInsertionError.
         @raise ValueError: If incorrect arguments are passed (see below).
         @return: A 3-C{tuple} with the number of checks done, the number of
             errors, and a C{dict} keyed by C{str} changes in C{changes}, with values
@@ -680,6 +718,7 @@ class SARS2Alignment:
                         aa=(what == "aa"),
                         onError=onError,
                         errFp=errFp,
+                        raiseOnReferenceGaps=raiseOnReferenceGaps,
                     )
                     testCountTotal += testCount
                     errorCountTotal += errorCount
@@ -720,7 +759,7 @@ class SARS2Alignment:
         featureName: Optional[str] = None,
         includeUntranslated: bool = False,
         minReferenceCoverage: Optional[float] = None,
-    ) -> dict:
+    ) -> Union[dict, None]:
         """
         Get information about genome features at an offset.
 
@@ -755,7 +794,7 @@ class SARS2Alignment:
         if relativeToFeature:
             if featureName is None:
                 raise ValueError(
-                    "If relativeToFeature is True, a feature " "name must be given."
+                    "If relativeToFeature is True, a feature name must be given."
                 )
             referenceOffset = self.features.referenceOffset(featureName, offset, aa)
         else:
@@ -815,13 +854,15 @@ class SARS2Alignment:
 
         codonOffset = referenceOffset - referenceFrame
         codon = self.features.reference.sequence[codonOffset : codonOffset + 3]
-        result["reference"]["aa"] = (
-            str(Seq(codon).translate()) if len(codon) == 3 else "X"
+        result["reference"].update(
+            {
+                "aa": str(Seq(codon).translate()) if len(codon) == 3 else "X",
+                "codon": codon,
+                "frame": referenceFrame,
+                "aaOffset": referenceCodonAaOffset,
+                "ntOffset": referenceOffset,
+            }
         )
-        result["reference"]["codon"] = codon
-        result["reference"]["frame"] = referenceFrame
-        result["reference"]["aaOffset"] = referenceCodonAaOffset
-        result["reference"]["ntOffset"] = referenceOffset
 
         # Genome.
         gappedOffset = self.gappedOffsets[referenceOffset]
@@ -841,16 +882,19 @@ class SARS2Alignment:
 
         codonOffset = gappedOffset - genomeFrame
         codon = self.genomeAligned.sequence[codonOffset : codonOffset + 3]
-        result["genome"]["aa"] = (
-            "-"
-            if "-" in codon
-            else (str(Seq(codon).translate()) if len(codon) == 3 else "X")
-        )
-        result["genome"]["codon"] = codon
-        result["genome"]["frame"] = genomeFrame
-        result["genome"]["aaOffset"] = genomeCodonAaOffset
-        result["genome"]["ntOffset"] = gappedOffset - (
-            self.genomeAligned.sequence[:gappedOffset].count("-")
+        result["genome"].update(
+            {
+                "aa": (
+                    "-"
+                    if "-" in codon
+                    else (str(Seq(codon).translate()) if len(codon) == 3 else "X")
+                ),
+                "codon": codon,
+                "frame": genomeFrame,
+                "aaOffset": genomeCodonAaOffset,
+                "ntOffset": gappedOffset
+                - (self.genomeAligned.sequence[:gappedOffset].count("-")),
+            }
         )
 
         result["alignmentOffset"] = gappedOffset
